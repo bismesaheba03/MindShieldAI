@@ -1,0 +1,8 @@
+streamlit
+pandas
+plotly
+matplotlib
+transformers
+torch
+textblob
+reportlab

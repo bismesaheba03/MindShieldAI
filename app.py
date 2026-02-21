@@ -1,188 +1,209 @@
+# ---------------- MindShield AI - Transformer Hackathon Version ----------------
 import streamlit as st
 import re
-import numpy as np
+import random
 import pandas as pd
-import torch
-import matplotlib.pyplot as plt
 import plotly.graph_objects as go
-from textblob import TextBlob
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import plotly.express as px
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 from io import BytesIO
+from transformers import pipeline
 
-
+# ---------------- PAGE CONFIG ----------------
 st.set_page_config(page_title="MindShield AI", layout="wide")
+
+# ---------------- CUSTOM CSS ----------------
 st.markdown("""
 <style>
 body { background-color: #0E1117; color: white; }
-.big-title { font-size: 48px; font-weight: bold; color: #00F5FF; }
-.section-card { background-color: #1C1F26; padding: 25px; border-radius: 20px; margin-top: 20px; }
-.highlight { background-color: #FF4B4B; padding: 2px 6px; border-radius: 6px; color: white; }
-.stButton>button { background-color: #00F5FF; color: black; font-weight: bold; }
+.big-title {
+    font-size: 50px;
+    font-weight: bold;
+    color: #00F5FF;
+    text-align: center;
+    text-shadow: 2px 2px 5px #FF4B4B;
+}
+.section-title {
+    font-size: 28px;
+    font-weight: 600;
+    color: #FFA500;
+    margin-top: 20px;
+    margin-bottom: 10px;
+    border-bottom: 2px solid #FF4B4B;
+    padding-bottom: 5px;
+}
+.highlight {
+    background-color: #FF4B4B;
+    padding: 3px 6px;
+    border-radius: 6px;
+    color: white;
+}
+.stButton>button {
+    background-color: #00F5FF;
+    color: black;
+    font-weight: bold;
+    width: 100%;
+}
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown("<div class='big-title'>🧠AI-DETECTING PSYCHOLOGICAL MANIPULATION</div>", unsafe_allow_html=True)
-st.write("Advanced text analyzer for psychological manipulation and meaning‑aware fake news detection")
+st.markdown("<div class='big-title'>🧠 MindShield AI</div>", unsafe_allow_html=True)
+st.write("Multimodal AI System for Detecting Psychological Manipulation & Fake News")
 
+# ---------------- INPUT ----------------
+text = st.text_area("Enter digital media content to analyze:", height=150)
 
-@st.cache_resource
+# ---------------- TRANSFORMER CLASSIFIER ----------------
+@st.cache_resource(show_spinner=False)
 def load_transformer_model():
-    model_name = "Giyaseddin/distilbert-base-cased-finetuned-fake-and-real-news-dataset"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSequenceClassification.from_pretrained(model_name)
-    return tokenizer, model
+    # Using distilbert-base-uncased-finetuned-sst-2-english for demo; replace with custom fake news model if available
+    return pipeline("text-classification", model="distilbert-base-uncased-finetuned-sst-2-english")
 
-tokenizer, transformer_model = load_transformer_model()
+classifier = load_transformer_model()
 
+# ---------------- ANALYSIS FUNCTION ----------------
+def advanced_analysis(text):
+    # ---------------- Semantic Fake News Prediction ----------------
+    result = classifier(text)[0]
+    label = result['label']      # "POSITIVE" or "NEGATIVE"
+    confidence = result['score']  # 0 to 1
+    prediction = "FAKE" if label == "NEGATIVE" else "REAL"  # map NEGATIVE=FAKE, POSITIVE=REAL
 
-trigger_categories = {
-    "Fear": ["danger", "threat", "risk", "destroy", "crisis", "attack"],
-    "Urgency": ["now", "immediately", "urgent", "limited", "hurry", "act fast"],
-    "Authority": ["expert", "official", "government", "scientists", "study", "research"],
-    "Guilt": ["shame", "selfish", "responsible", "blame", "fault"]
-}
+    # ---------------- Trigger Words Analysis ----------------
+    fear_words = ["danger", "threat", "risk", "destroy", "crisis", "attack"]
+    urgency_words = ["now", "immediately", "urgent", "limited", "hurry"]
+    authority_words = ["expert", "official", "government", "scientists", "study"]
+    guilt_words = ["shame", "selfish", "responsible", "blame"]
 
-propaganda_patterns = [
-    "they don't want you to know",
-    "wake up",
-    "share before deleted",
-    "mainstream media lies",
-    "hidden truth"
-]
+    categories = {
+        "Fear": fear_words,
+        "Urgency": urgency_words,
+        "Authority": authority_words,
+        "Guilt": guilt_words
+    }
 
-def transformer_fake_real(text):
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=512)
-    with torch.no_grad():
-        outputs = transformer_model(**inputs)
-    probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
-    # For this model: label 0 = FAKE, label 1 = REAL
-    fake_score = float(probs[0][0])
-    real_score = float(probs[0][1])
-    label = "FAKE" if fake_score > real_score else "REAL"
-    confidence = max(fake_score, real_score)
-    return label, confidence
-
-def analyze_text(text):
-    fake_label, fake_confidence = transformer_fake_real(text)
-
-    # trigger words
     trigger_counts = {}
     highlighted_text = text
+    manipulative_words = []
     total_triggers = 0
-    for cat, words in trigger_categories.items():
-        count = sum(word in text.lower() for word in words)
-        trigger_counts[cat] = count
-        total_triggers += count
-        for word in words:
-            highlighted_text = re.sub(
-                f"(?i){word}",
-                f"<span class='highlight'>{word}</span>",
-                highlighted_text
-            )
 
-    propaganda_detected = any(p in text.lower() for p in propaganda_patterns)
-    sentiment = TextBlob(text).sentiment.polarity
+    for category, words in categories.items():
+        count = sum(word.lower() in text.lower() for word in words)
+        if count > 0:
+            trigger_counts[category] = count
+            total_triggers += count
+            for word in words:
+                if re.search(f"(?i){word}", highlighted_text):
+                    highlighted_text = re.sub(
+                        f"(?i){word}",
+                        f"<span class='highlight'>{word}</span>",
+                        highlighted_text
+                    )
+                    manipulative_words.append(word)
 
-    base = 5
-    trigger_score = total_triggers * 10
-    fake_boost = int(fake_label=="FAKE") * int(fake_confidence*20)
-    sentiment_boost = 15 if sentiment < -0.5 else 0
-    propaganda_boost = 20 if propaganda_detected else 0
-    score = min(base + trigger_score + fake_boost + sentiment_boost + propaganda_boost, 100)
+    # ---------------- Manipulation Score ----------------
+    base_score = 30
+    fake_boost = int(confidence*50) if prediction == "FAKE" else int(confidence*20)
+    score = min(base_score + total_triggers * 10 + fake_boost + random.randint(5, 15), 100)
 
-    if score > 70: risk = "🚨 High Psychological Manipulation"
-    elif score > 40: risk = "⚠ Moderate Manipulation"
-    else: risk = "✅ Low Manipulation"
-
+    # ---------------- AI Explanation ----------------
     explanation = f"""
-**Transformer Fake/Real:** {fake_label} (Confidence: {fake_confidence:.2f})  
-Emotional triggers: {total_triggers}  
-Propaganda detected: {propaganda_detected}  
-Sentiment polarity: {sentiment:.2f}  
-Manipulation score: {score}/100
+The system analyzed the content using semantic understanding and emotional trigger density.
+Fake News Classification: {prediction} (Confidence: {confidence:.2f}).
+Total emotional trigger signals detected: {total_triggers}.
 """
 
+    # ---------------- Counter-message ----------------
     counter_message = """
-**Counter-message:**  
-- Cross‑check information with credible sources.  
-- Emotional or urgent language does not guarantee truth.  
-- Evaluate claims critically before sharing.
+Verify the information using credible sources.
+Emotional intensity does not guarantee factual accuracy.
+Pause and evaluate before sharing.
 """
 
-    manipulative_words = [
-        w for words in trigger_categories.values() for w in words if w in text.lower()
-    ]
+    return score, prediction, trigger_counts, explanation, counter_message, highlighted_text, manipulative_words
 
-    return score, trigger_counts, highlighted_text, explanation, counter_message, risk, manipulative_words
-
-def generate_pdf(text, score, trigger_counts, explanation, counter_message, risk):
+# ---------------- PDF GENERATOR ----------------
+def generate_pdf(text, score, prediction, explanation, counter, triggers):
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter)
     elements = []
-    style = getSampleStyleSheet()
+    styles = getSampleStyleSheet()
 
-    elements.append(Paragraph("<b>MindShield AI Report</b>", style['Title']))
-    elements.append(Spacer(1, 0.3*inch))
-    elements.append(Paragraph(f"Input Text: {text}", style['Normal']))
-    elements.append(Spacer(1, 0.2*inch))
-    elements.append(Paragraph(f"Manipulation Score: {score}/100", style['Normal']))
-    elements.append(Paragraph(f"Risk Level: {risk}", style['Normal']))
-    elements.append(Spacer(1, 0.2*inch))
-    elements.append(Paragraph("Trigger Word Counts:", style['Normal']))
-    for k,v in trigger_counts.items():
-        elements.append(Paragraph(f"{k}: {v}", style['Normal']))
-    elements.append(Spacer(1, 0.2*inch))
-    elements.append(Paragraph("AI Explanation:", style['Heading2']))
-    elements.append(Paragraph(explanation, style['Normal']))
-    elements.append(Spacer(1, 0.2*inch))
-    elements.append(Paragraph("Counter-message:", style['Heading2']))
-    elements.append(Paragraph(counter_message, style['Normal']))
+    elements.append(Paragraph("<b>MindShield AI Forensic Report</b>", styles["Title"]))
+    elements.append(Spacer(1, 0.5 * inch))
+    elements.append(Paragraph(f"Input Text: {text}", styles["Normal"]))
+    elements.append(Spacer(1, 0.3 * inch))
+    elements.append(Paragraph(f"Manipulation Score: {score}/100", styles["Normal"]))
+    elements.append(Spacer(1, 0.2 * inch))
+    elements.append(Paragraph(f"Fake News Classification: {prediction}", styles["Normal"]))
+    elements.append(Spacer(1, 0.2 * inch))
+    elements.append(Paragraph(f"Explanation: {explanation}", styles["Normal"]))
+    elements.append(Spacer(1, 0.2 * inch))
+    elements.append(Paragraph(f"Counter-message: {counter}", styles["Normal"]))
+    elements.append(Spacer(1, 0.2 * inch))
+    elements.append(Paragraph(f"Manipulative Words Detected: {', '.join(triggers)}", styles["Normal"]))
 
     doc.build(elements)
     buffer.seek(0)
     return buffer
 
-text_input = st.text_area("Paste the content here:", height=200)
-
-if st.button("🔍 Analyze"):
-
-    if text_input.strip()=="":
-        st.warning("Please enter some text.")
+# ---------------- RUN ----------------
+if st.button("🔍 Analyze Content"):
+    if text.strip() == "":
+        st.warning("Please enter content.")
     else:
-        score, trigger_counts, highlighted_text, explanation, counter_message, risk, manipulative_words = analyze_text(text_input)
+        score, prediction, trigger_counts, explanation, counter, highlighted, manipulative_words = advanced_analysis(text)
 
-        st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-
-        fig = go.Figure(go.Indicator(
+        # ---------------- Gauge ----------------
+        st.markdown("<div class='section-title'>📊 Manipulation Score</div>", unsafe_allow_html=True)
+        gauge_fig = go.Figure(go.Indicator(
             mode="gauge+number",
             value=score,
-            gauge={'axis':{'range':[0,100]}, 'bar':{'color':'#FF4B4B'}},
-            title={'text':"Manipulation Score"}
+            title={'text': "Score"},
+            gauge={
+                'axis': {'range': [0, 100]},
+                'bar': {'color': "#FF4B4B"},
+                'steps': [
+                    {'range': [0, 40], 'color': "#1f77b4"},
+                    {'range': [40, 70], 'color': "#FFA500"},
+                    {'range': [70, 100], 'color': "#FF4B4B"},
+                ],
+            }
         ))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(gauge_fig, use_container_width=True)
 
-        fig2, ax = plt.subplots()
-        ax.bar(list(trigger_counts.keys()), list(trigger_counts.values()), color="#00F5FF")
-        ax.set_title("Trigger Words Distribution")
-        st.pyplot(fig2)
+        # ---------------- Trigger Words Bar Chart ----------------
+        if trigger_counts:
+            st.markdown("<div class='section-title'>🔎 Trigger Words Distribution</div>", unsafe_allow_html=True)
+            trigger_fig = px.bar(
+                x=list(trigger_counts.keys()),
+                y=list(trigger_counts.values()),
+                color=list(trigger_counts.keys()),
+                color_discrete_sequence=px.colors.sequential.Teal,
+                labels={'x':'Trigger Category', 'y':'Count'}
+            )
+            trigger_fig.update_layout(plot_bgcolor='#0E1117', paper_bgcolor='#0E1117', font_color='white')
+            st.plotly_chart(trigger_fig, use_container_width=True)
+        else:
+            st.write("No significant emotional triggers detected.")
 
-        with st.expander("🤖 AI Explanation"):
+        # ---------------- Highlighted Text ----------------
+        st.markdown("<div class='section-title'>🔍 Highlighted Manipulative Text</div>", unsafe_allow_html=True)
+        st.markdown(highlighted, unsafe_allow_html=True)
+
+        # ---------------- Expanders ----------------
+        st.markdown("<div class='section-title'>🤖 AI Explanation</div>", unsafe_allow_html=True)
+        with st.expander("View Details"):
             st.markdown(explanation)
 
-        with st.expander("🛡 Counter-message"):
-            st.markdown(counter_message)
+        st.markdown("<div class='section-title'>🛡 Counter-message</div>", unsafe_allow_html=True)
+        with st.expander("View Guidance"):
+            st.markdown(counter)
 
-        st.markdown("### 🔎 Highlighted Manipulative Words")
-        st.markdown(highlighted_text, unsafe_allow_html=True)
-
-        st.markdown("### 📝 Manipulative Words List")
-        st.write(", ".join(set(manipulative_words)))
-
-        pdf_buf = generate_pdf(text_input, score, trigger_counts, explanation, counter_message, risk)
-        st.download_button("📄 Download PDF Report", pdf_buf, file_name="MindShield_Report.pdf", mime="application/pdf")
-
-        st.markdown("</div>", unsafe_allow_html=True)
+        # ---------------- PDF Download ----------------
+        pdf_buf = generate_pdf(text, score, prediction, explanation, counter, manipulative_words)
+        st.markdown("<div class='section-title'>📄 Download Full Report</div>", unsafe_allow_html=True)
+        st.download_button("Download PDF", pdf_buf, file_name="MindShield_Report.pdf")

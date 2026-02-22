@@ -6,8 +6,9 @@ import streamlit as st
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from textblob import TextBlob
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps, ImageFilter
 import pytesseract
+import cv2
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
@@ -182,112 +183,222 @@ tokenizer, transformer_model = load_transformer_model()
 
 
 # =============================
-# OCR — color-aware preprocessing for tough images
-# plain grayscale fails on yellow/white text over dark busy backgrounds
-# so we use numpy to isolate text by brightness and color before OCR
+# EASYOCR — loaded once and cached
 # =============================
-def _run_ocr(pil_img, psm=11):
-    config = f"--psm {psm} --oem 3"
+@st.cache_resource
+def load_easyocr_reader():
     try:
-        return pytesseract.image_to_string(pil_img, config=config).strip()
+        import easyocr
+        return easyocr.Reader(["en"], gpu=False, verbose=False)
     except Exception:
-        return ""
+        return None
 
 
-def _score_text(text):
-    """Score by real English words — penalise single chars and junk symbols."""
+# =============================
+# IMPROVED OCR — multi-engine, multi-strategy
+# =============================
+
+def _pil_to_cv2(pil_img):
+    """Convert PIL RGB image to OpenCV BGR array."""
+    return cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+
+def _cv2_to_pil(cv2_img):
+    """Convert OpenCV BGR array to PIL grayscale."""
+    gray = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
+    return Image.fromarray(gray)
+
+
+def _score_text(text: str) -> float:
+    """Score OCR output by real 3+ letter word count minus noise."""
     if not text:
-        return 0
-    # count proper words (3+ letters — filters out OCR noise like 'a', 'f', '|')
+        return 0.0
     words = re.findall(r"[A-Za-z]{3,}", text)
-    junk  = len(re.findall(r"[^A-Za-z0-9\s'\".,!?'-]", text))
+    junk = len(re.findall(r"[^A-Za-z0-9\s'\".,!?()\-]", text))
     return len(words) * 5 - junk * 2
 
 
-def _clean_ocr(text):
-    """Keep only lines that are mostly alphabetic, strip noise, join."""
+def _clean_ocr(text: str) -> str:
+    """Remove noisy lines; keep lines that are mostly alphabetic."""
     good = []
     for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
         alpha = sum(1 for c in line if c.isalpha())
-        # need at least 50% letters, minimum 3 alpha chars
-        if alpha >= 3 and alpha / max(len(line), 1) >= 0.50:
-            # strip leading symbols from each line
-            line = re.sub(r"^[^A-Za-z']+", "", line).strip()
+        if alpha >= 3 and alpha / max(len(line), 1) >= 0.45:
+            line = re.sub(r"^[^A-Za-z'\"]+", "", line).strip()
             if line:
                 good.append(line)
     out = " ".join(good)
-    out = re.sub(r"\s+", " ", out)
-    return out.strip()
+    return re.sub(r"\s+", " ", out).strip()
 
 
-def _make_mask(arr, condition):
-    """Return a PIL greyscale image where condition pixels are white, rest black."""
-    mask = condition.astype(np.uint8) * 255
-    return Image.fromarray(mask)
+def _tesseract_on_pil(pil_gray, psm: int = 11) -> str:
+    """Run Tesseract on a PIL grayscale image."""
+    config = f"--psm {psm} --oem 3"
+    try:
+        return pytesseract.image_to_string(pil_gray, config=config).strip()
+    except Exception:
+        return ""
 
 
-def extract_text_from_image(pil_image):
+def _preprocess_variants(pil_rgb: Image.Image):
     """
-    Multi-pass OCR that handles stylized meme/news text:
-    - Large bold white text on dark photo backgrounds
-    - Yellow text on dark backgrounds
-    - Mixed colour overlays
-    Runs ~12 preprocessing variants and returns the one with the most real words.
+    Generate a list of preprocessed PIL-grayscale images from an RGB PIL image.
+    Returns list of (label, pil_gray_image) tuples.
     """
-    from PIL import ImageEnhance, ImageOps, ImageFilter
+    variants = []
+    bgr = _pil_to_cv2(pil_rgb)
 
-    rgb = pil_image.convert("RGB")
-    w, h = rgb.size
+    # 1. Upscale 3x — best single improvement for Tesseract
+    w, h = pil_rgb.size
+    big_pil = pil_rgb.resize((w * 3, h * 3), Image.LANCZOS)
+    big_bgr = _pil_to_cv2(big_pil)
+    big_gray = cv2.cvtColor(big_bgr, cv2.COLOR_BGR2GRAY)
 
-    # upscale 3x — single biggest accuracy improvement for tesseract
-    big = rgb.resize((w * 3, h * 3), Image.LANCZOS)
-    arr = np.array(big, dtype=np.float32)
+    # 2. Standard grayscale, upscaled
+    variants.append(("gray_3x", Image.fromarray(big_gray)))
+
+    # 3. Adaptive thresholding (great for uneven lighting)
+    adaptive = cv2.adaptiveThreshold(
+        big_gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 31, 11
+    )
+    variants.append(("adaptive_thresh", Image.fromarray(adaptive)))
+
+    # 4. Adaptive thresh inverted (dark text on light background)
+    variants.append(("adaptive_thresh_inv", Image.fromarray(cv2.bitwise_not(adaptive))))
+
+    # 5. Otsu binarization
+    _, otsu = cv2.threshold(big_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants.append(("otsu", Image.fromarray(otsu)))
+    variants.append(("otsu_inv", Image.fromarray(cv2.bitwise_not(otsu))))
+
+    # 6. CLAHE (local contrast enhancement) + Otsu
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    clahe_img = clahe.apply(big_gray)
+    _, clahe_thresh = cv2.threshold(clahe_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants.append(("clahe_otsu", Image.fromarray(clahe_thresh)))
+
+    # 7. Morphological dilation to connect broken letters
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    dilated = cv2.dilate(clahe_thresh, kernel, iterations=1)
+    variants.append(("dilated", Image.fromarray(dilated)))
+
+    # 8. White/bright text isolation (for white text on dark backgrounds)
+    arr = np.array(big_pil, dtype=np.float32)
     R, G, B = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
-
-    attempts = []
-    gray_pil = big.convert("L")
-
-    # ---- bright text masks at several thresholds ----
-    # lower threshold = more pixels included = better recall but more noise
     brightness = (R + G + B) / 3.0
-    for thr in [140, 160, 180, 200]:
-        mask = _make_mask(arr, brightness > thr)
-        attempts.append(_run_ocr(mask, psm=11))
-        attempts.append(_run_ocr(mask, psm=6))
+    for thr in [150, 170, 190, 210]:
+        mask = (brightness > thr).astype(np.uint8) * 255
+        variants.append((f"bright_{thr}", Image.fromarray(mask)))
 
-    # ---- yellow text mask (high R+G, low B — catches yellow on dark) ----
-    yellow = (R > 150) & (G > 120) & (B < 110)
-    attempts.append(_run_ocr(_make_mask(arr, yellow), psm=11))
-    attempts.append(_run_ocr(_make_mask(arr, yellow), psm=6))
+    # 9. Yellow text isolation (meme yellow/orange text)
+    yellow = ((R > 150) & (G > 120) & (B < 110)).astype(np.uint8) * 255
+    variants.append(("yellow_text", Image.fromarray(yellow)))
 
-    # ---- combined white + yellow ----
-    white_or_yellow = (brightness > 160) | yellow
-    attempts.append(_run_ocr(_make_mask(arr, white_or_yellow), psm=11))
+    # 10. White + Yellow combined
+    combined = np.clip(mask.astype(np.uint16) + yellow.astype(np.uint16), 0, 255).astype(np.uint8)
+    variants.append(("white_yellow", Image.fromarray(combined)))
 
-    # ---- high-contrast greyscale ----
-    hi = ImageEnhance.Contrast(gray_pil).enhance(3.0)
-    attempts.append(_run_ocr(hi, psm=11))
-    attempts.append(_run_ocr(hi, psm=6))
+    # 11. Sharpened + contrast enhanced
+    pil_gray_big = Image.fromarray(big_gray)
+    sharp = pil_gray_big.filter(ImageFilter.SHARPEN).filter(ImageFilter.SHARPEN)
+    sharp = ImageEnhance.Contrast(sharp).enhance(2.5)
+    variants.append(("sharp_contrast", sharp))
 
-    # ---- inverted (for dark-on-light text regions) ----
-    inv = ImageOps.invert(gray_pil)
-    attempts.append(_run_ocr(ImageEnhance.Contrast(inv).enhance(2.5), psm=11))
+    # 12. Inverted for dark-on-light
+    inv = ImageOps.invert(Image.fromarray(big_gray))
+    inv = ImageEnhance.Contrast(inv).enhance(2.0)
+    variants.append(("inverted", inv))
 
-    # ---- sharpened ----
-    sharp = gray_pil.filter(ImageFilter.SHARPEN).filter(ImageFilter.SHARPEN)
-    attempts.append(_run_ocr(ImageEnhance.Contrast(sharp).enhance(2.5), psm=11))
+    # 13. Denoised with bilateral filter
+    denoised = cv2.bilateralFilter(big_gray, 9, 75, 75)
+    _, denoised_thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants.append(("bilateral_otsu", Image.fromarray(denoised_thresh)))
 
-    # pick the attempt with the most real 3+ letter words
-    best = max(attempts, key=_score_text)
-    return _clean_ocr(best)
+    return variants
+
+
+def _run_tesseract_all(variants):
+    """Run Tesseract on all variants with multiple PSM modes."""
+    results = []
+    for label, pil_gray in variants:
+        for psm in [6, 11, 3]:
+            text = _tesseract_on_pil(pil_gray, psm=psm)
+            if text:
+                results.append(text)
+    return results
+
+
+def _run_easyocr(pil_rgb: Image.Image, reader) -> list:
+    """Run EasyOCR on the original and upscaled image."""
+    results = []
+    try:
+        np_img = np.array(pil_rgb.convert("RGB"))
+        raw = reader.readtext(np_img, detail=0, paragraph=True)
+        results.append(" ".join(raw))
+
+        # Also try upscaled
+        w, h = pil_rgb.size
+        big = pil_rgb.resize((w * 2, h * 2), Image.LANCZOS)
+        np_big = np.array(big.convert("RGB"))
+        raw_big = reader.readtext(np_big, detail=0, paragraph=True)
+        results.append(" ".join(raw_big))
+    except Exception:
+        pass
+    return results
+
+
+def extract_text_from_image(pil_image: Image.Image) -> str:
+    """
+    Robust multi-engine OCR:
+      1. Generates 15+ preprocessing variants
+      2. Runs Tesseract (PSM 3/6/11) on all variants
+      3. Runs EasyOCR on original + upscaled (if available)
+      4. Picks the result with the highest real-word score
+      5. Cleans and returns the best output
+    """
+    pil_rgb = pil_image.convert("RGB")
+
+    all_texts = []
+
+    # --- Tesseract engine ---
+    try:
+        variants = _preprocess_variants(pil_rgb)
+        tess_results = _run_tesseract_all(variants)
+        all_texts.extend(tess_results)
+    except Exception as e:
+        st.warning(f"Tesseract preprocessing error (non-fatal): {e}")
+
+    # --- EasyOCR engine ---
+    try:
+        reader = load_easyocr_reader()
+        if reader is not None:
+            easy_results = _run_easyocr(pil_rgb, reader)
+            all_texts.extend(easy_results)
+    except Exception as e:
+        st.warning(f"EasyOCR error (non-fatal): {e}")
+
+    if not all_texts:
+        return ""
+
+    best = max(all_texts, key=_score_text)
+    cleaned = _clean_ocr(best)
+
+    # If cleaned result is very short, try the raw best without strict cleaning
+    if len(cleaned.split()) < 5:
+        raw_cleaned = re.sub(r"\s+", " ", best).strip()
+        if _score_text(raw_cleaned) > _score_text(cleaned):
+            return raw_cleaned
+
+    return cleaned
 
 
 # =============================
 # TRANSFORMER FAKE/REAL DETECTION
-# chunks long text so nothing is silently truncated
 # =============================
 def transformer_fake_real(text):
     words = text.split()
@@ -301,7 +412,6 @@ def transformer_fake_real(text):
             logits = transformer_model(**inputs).logits
         probs = torch.softmax(logits, dim=-1)[0].tolist()
 
-        # read label order from the model config, not hardcoded
         id2label = transformer_model.config.id2label
         fake_idx = next((i for i, v in id2label.items() if "fake" in str(v).lower()), 0)
         real_idx = 1 - fake_idx
@@ -360,7 +470,6 @@ def analyze_text(text):
         if abs(b.sentiment.polarity) > 0.6 and b.sentiment.subjectivity > 0.6:
             extreme_sentences.append(s)
 
-    # composite score — each signal contributes a capped amount
     tech_score      = min(35, weighted_trigger_total * 4)
     model_score     = fake_p * 25
     sentiment_sc    = abs(sentiment) * 10 if abs(sentiment) > 0.3 else 0
@@ -383,7 +492,6 @@ def analyze_text(text):
     else:
         risk = "✅ Low Manipulation"
 
-    # dynamic explanation — built from what was actually found
     parts = []
 
     if fake_label == "FAKE" and fake_confidence > 0.65:
@@ -469,7 +577,6 @@ def analyze_text(text):
         f"typography {math.floor(caps_sc + exclaim_sc)}/10"
     )
 
-    # counter-messages pulled from detected techniques
     counter_lookup = {
         "Fear": [
             "Fear-based claims often exaggerate probability. Look up base rates and actual statistics before reacting.",
@@ -660,7 +767,7 @@ if uploaded_image is not None:
     st.image(pil_img, caption="Uploaded Image", width=600)
 
     if st.button("🔠 Extract Text from Image"):
-        with st.spinner("Reading text from image..."):
+        with st.spinner("Reading text from image (multi-engine OCR)..."):
             extracted = extract_text_from_image(pil_img)
         if extracted:
             st.session_state["extracted_text"] = extracted
@@ -693,7 +800,6 @@ if st.button("🔍 Analyze"):
 
         st.markdown("<div class='section-card'>", unsafe_allow_html=True)
 
-        # gauge — colour changes by risk level
         gauge_color = "#FF4B4B" if score >= 70 else ("#F59E0B" if score >= 40 else "#10B981")
         fig = go.Figure(go.Indicator(
             mode="gauge+number",
@@ -717,10 +823,8 @@ if st.button("🔍 Analyze"):
         fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", font_color="white", height=280)
         st.plotly_chart(fig, width="stretch", config={"responsive": True})
 
-        # risk label
         st.markdown(f"### {risk}")
 
-        # horizontal bar chart per category
         fig2, ax = plt.subplots(figsize=(8, 3))
         fig2.patch.set_alpha(0)
         ax.set_facecolor("#1C1F26")

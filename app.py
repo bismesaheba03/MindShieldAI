@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from textblob import TextBlob
 from PIL import Image
-import easyocr
+import pytesseract
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
@@ -23,7 +23,7 @@ st.set_page_config(page_title="MindShield AI", layout="centered")
 
 
 # =============================
-# CUSTOM CSS (original, untouched)
+# CUSTOM CSS
 # =============================
 st.markdown("""
 <style>
@@ -84,8 +84,6 @@ st.write("Advanced text analyzer for psychological manipulation and meaning-awar
 
 # =============================
 # TRIGGER WORD CATEGORIES
-# expanded from 4 small lists to 8 detailed ones so hidden manipulation
-# patterns that slipped through before are now caught
 # =============================
 trigger_categories = {
     "Fear": [
@@ -134,7 +132,6 @@ trigger_categories = {
     ],
 }
 
-# weights per category — some categories are stronger manipulation signals than others
 CATEGORY_WEIGHTS = {
     "Fear": 3,
     "Urgency": 3,
@@ -146,7 +143,6 @@ CATEGORY_WEIGHTS = {
     "Emotional Overload": 2,
 }
 
-# known propaganda phrases — scored separately because they're very specific signals
 propaganda_patterns = [
     "they don't want you to know",
     "wake up sheeple",
@@ -163,7 +159,6 @@ propaganda_patterns = [
     "shadow government",
 ]
 
-# logical fallacy markers — catch manipulative argument structures
 logical_fallacies = {
     "Ad Hominem":     ["stupid", "idiot", "moron", "liar", "hypocrite", "paid shill", "brainwashed"],
     "Slippery Slope": ["will lead to", "next thing you know", "soon they will", "it starts with", "beginning of the end"],
@@ -173,7 +168,7 @@ logical_fallacies = {
 
 
 # =============================
-# MODEL LOADING
+# TRANSFORMER MODEL
 # =============================
 @st.cache_resource
 def load_transformer_model():
@@ -187,30 +182,17 @@ tokenizer, transformer_model = load_transformer_model()
 
 
 # =============================
-# OCR MODEL LOADING
-# easyocr is cached just like the transformer — loads once per session
-# gpu=True speeds it up if CUDA is available, falls back to CPU otherwise
+# OCR — pytesseract (no model download, installed via packages.txt)
 # =============================
-@st.cache_resource
-def load_ocr_reader():
-    return easyocr.Reader(['en'], gpu=torch.cuda.is_available())
-
-ocr_reader = load_ocr_reader()
-
-
 def extract_text_from_image(pil_image):
-    """Convert a PIL image to an RGB numpy array and run easyocr on it.
-    Returns a single string with all detected text joined by newlines."""
-    img_array = np.array(pil_image.convert("RGB"))
-    # paragraph=True groups nearby words into coherent sentences
-    results = ocr_reader.readtext(img_array, detail=0, paragraph=True)
-    return "\n".join(results).strip()
+    rgb = pil_image.convert("RGB")
+    text = pytesseract.image_to_string(rgb)
+    return text.strip()
 
 
 # =============================
 # TRANSFORMER FAKE/REAL DETECTION
-# splits long text into 400-word chunks and averages probabilities
-# so a 2000-word article isn't just truncated to the first 512 tokens
+# chunks long text so nothing is silently truncated
 # =============================
 def transformer_fake_real(text):
     words = text.split()
@@ -224,7 +206,7 @@ def transformer_fake_real(text):
             logits = transformer_model(**inputs).logits
         probs = torch.softmax(logits, dim=-1)[0].tolist()
 
-        # read label order from the model config rather than assuming index 0 = FAKE
+        # read label order from the model config, not hardcoded
         id2label = transformer_model.config.id2label
         fake_idx = next((i for i, v in id2label.items() if "fake" in str(v).lower()), 0)
         real_idx = 1 - fake_idx
@@ -240,15 +222,13 @@ def transformer_fake_real(text):
 
 
 # =============================
-# ANALYSIS FUNCTION
+# CORE ANALYSIS
 # =============================
 def analyze_text(text):
     text_lower = text.lower()
 
-    # --- transformer ---
     fake_label, fake_confidence, fake_p, real_p = transformer_fake_real(text)
 
-    # --- keyword triggers ---
     trigger_counts = {}
     all_matched_words = set()
     total_triggers = 0
@@ -261,48 +241,39 @@ def analyze_text(text):
         total_triggers += len(matched)
         weighted_trigger_total += len(matched) * CATEGORY_WEIGHTS.get(cat, 2)
 
-    # --- propaganda ---
     propaganda_hits = [p for p in propaganda_patterns if p in text_lower]
     propaganda_detected = len(propaganda_hits) > 0
 
-    # --- logical fallacies ---
     fallacy_hits = {}
     for fname, fwords in logical_fallacies.items():
         m = [w for w in fwords if w in text_lower]
         if m:
             fallacy_hits[fname] = m
 
-    # --- sentiment & subjectivity ---
     blob = TextBlob(text)
     sentiment = blob.sentiment.polarity
     subjectivity = blob.sentiment.subjectivity
 
-    # --- typography signals ---
     alpha_chars = [c for c in text if c.isalpha()]
     caps_ratio = sum(1 for c in alpha_chars if c.isupper()) / len(alpha_chars) if alpha_chars else 0
     sentences = [s.strip() for s in re.split(r"[.!?]", text) if len(s.strip()) > 10]
     exclaim_density = text.count("!") / max(len(sentences), 1)
 
-    # --- find emotionally extreme sentences ---
     extreme_sentences = []
     for s in sentences:
         b = TextBlob(s)
         if abs(b.sentiment.polarity) > 0.6 and b.sentiment.subjectivity > 0.6:
             extreme_sentences.append(s)
 
-    # =============================
-    # COMPOSITE SCORE
-    # each signal contributes a capped amount so no single factor
-    # can dominate the entire score on its own
-    # =============================
-    tech_score     = min(35, weighted_trigger_total * 4)
-    model_score    = fake_p * 25
-    sentiment_sc   = abs(sentiment) * 10 if abs(sentiment) > 0.3 else 0
+    # composite score — each signal contributes a capped amount
+    tech_score      = min(35, weighted_trigger_total * 4)
+    model_score     = fake_p * 25
+    sentiment_sc    = abs(sentiment) * 10 if abs(sentiment) > 0.3 else 0
     subjectivity_sc = subjectivity * 8 if subjectivity > 0.5 else 0
-    propaganda_sc  = min(15, len(propaganda_hits) * 5)
-    fallacy_sc     = min(10, len(fallacy_hits) * 3)
-    caps_sc        = min(5,  caps_ratio * 20)
-    exclaim_sc     = min(5,  exclaim_density * 5)
+    propaganda_sc   = min(15, len(propaganda_hits) * 5)
+    fallacy_sc      = min(10, len(fallacy_hits) * 3)
+    caps_sc         = min(5, caps_ratio * 20)
+    exclaim_sc      = min(5, exclaim_density * 5)
 
     score = math.floor(
         5 + tech_score + model_score + sentiment_sc + subjectivity_sc
@@ -310,7 +281,6 @@ def analyze_text(text):
     )
     score = max(0, min(100, score))
 
-    # --- risk level ---
     if score >= 70:
         risk = "🚨 High Psychological Manipulation"
     elif score >= 40:
@@ -318,23 +288,19 @@ def analyze_text(text):
     else:
         risk = "✅ Low Manipulation"
 
-    # =============================
-    # DYNAMIC EXPLANATION
-    # built from what was actually detected instead of a fixed template
-    # =============================
+    # dynamic explanation — built from what was actually found
     parts = []
 
     if fake_label == "FAKE" and fake_confidence > 0.65:
         parts.append(
             f"**Fake News Model:** The transformer classified this as likely **fabricated or misleading** "
-            f"({fake_confidence:.0%} confidence). The writing patterns and narrative structure deviate "
-            f"significantly from authentic reporting."
+            f"({fake_confidence:.0%} confidence). Writing patterns deviate significantly from authentic reporting."
         )
     elif fake_label == "FAKE":
         parts.append(
-            f"**Fake News Model:** Content was flagged as **potentially misleading** "
-            f"({fake_confidence:.0%} confidence). Some linguistic markers suggest distorted framing — "
-            f"independent verification is recommended."
+            f"**Fake News Model:** Content flagged as **potentially misleading** "
+            f"({fake_confidence:.0%} confidence). Some markers suggest distorted framing — "
+            f"independent verification recommended."
         )
     else:
         parts.append(
@@ -355,49 +321,44 @@ def analyze_text(text):
     if propaganda_hits:
         joined = ", ".join(f'"{p}"' for p in propaganda_hits[:3])
         parts.append(
-            f"**Propaganda Phrases Detected:** {joined}. "
-            f"These phrases are designed to prime distrust in credible institutions and make "
-            f"alternative narratives feel like suppressed revelations."
+            f"**Propaganda Phrases:** {joined}. "
+            f"These prime distrust in credible institutions and make alternative narratives feel like suppressed revelations."
         )
 
     if fallacy_hits:
         f_names = ", ".join(f"**{f}**" for f in fallacy_hits)
         parts.append(
-            f"**Logical Fallacies Present:** {f_names}. "
+            f"**Logical Fallacies:** {f_names}. "
             f"These substitute emotional pressure for actual logical argument."
         )
 
     if sentiment < -0.4:
         parts.append(
             f"**Strongly Negative Sentiment (polarity: {sentiment:.2f}):** "
-            f"The persistent negativity narrows perceived options and raises psychological stress in the reader."
+            f"Persistent negativity narrows perceived options and raises psychological stress in the reader."
         )
     elif sentiment > 0.4 and score > 40:
         parts.append(
             f"**Suspiciously Positive Tone ({sentiment:.2f}):** "
-            f"Unrealistically upbeat framing at high manipulation scores can signal false promises or persuasion tactics."
+            f"Unrealistically upbeat framing at high manipulation scores can signal false promises."
         )
 
     if subjectivity > 0.65:
         parts.append(
-            f"**High Subjectivity ({subjectivity:.0%}):** Most of this content is opinion and personal "
-            f"interpretation, yet it may be presented as objective fact."
+            f"**High Subjectivity ({subjectivity:.0%}):** Most content is opinion and interpretation, "
+            f"yet may be presented as objective fact."
         )
 
     if caps_ratio > 0.25:
         parts.append(
-            f"**Aggressive Typography ({caps_ratio:.0%} uppercase):** Heavy capitalisation is a visual "
-            f"shouting technique that bypasses calm reading and triggers emotional arousal."
+            f"**Aggressive Typography ({caps_ratio:.0%} uppercase):** "
+            f"Heavy capitalisation is a visual shouting technique that bypasses calm reading."
         )
 
     if extreme_sentences:
-        parts.append(
-            f"**{len(extreme_sentences)} emotionally extreme sentence(s) found.** "
-            f"Example: \"{extreme_sentences[0][:120]}...\""
-            if len(extreme_sentences[0]) > 120
-            else f"**{len(extreme_sentences)} emotionally extreme sentence(s) found.** "
-                 f"Example: \"{extreme_sentences[0]}\""
-        )
+        example = extreme_sentences[0]
+        snippet = (example[:120] + "...") if len(example) > 120 else example
+        parts.append(f"**{len(extreme_sentences)} emotionally extreme sentence(s) found.** Example: \"{snippet}\"")
 
     if not parts:
         parts.append(
@@ -406,15 +367,14 @@ def analyze_text(text):
         )
 
     explanation = "\n\n".join(parts)
-    explanation += f"\n\n**Score breakdown:** keywords {math.floor(tech_score)}/35 · " \
-                   f"model {math.floor(model_score)}/25 · sentiment {math.floor(sentiment_sc)}/10 · " \
-                   f"propaganda {math.floor(propaganda_sc)}/15 · fallacies {math.floor(fallacy_sc)}/10 · " \
-                   f"typography {math.floor(caps_sc + exclaim_sc)}/10"
+    explanation += (
+        f"\n\n**Score breakdown:** keywords {math.floor(tech_score)}/35 · "
+        f"model {math.floor(model_score)}/25 · sentiment {math.floor(sentiment_sc)}/10 · "
+        f"propaganda {math.floor(propaganda_sc)}/15 · fallacies {math.floor(fallacy_sc)}/10 · "
+        f"typography {math.floor(caps_sc + exclaim_sc)}/10"
+    )
 
-    # =============================
-    # COUNTER-MESSAGES
-    # pulled from the specific techniques detected, not generic advice
-    # =============================
+    # counter-messages pulled from detected techniques
     counter_lookup = {
         "Fear": [
             "Fear-based claims often exaggerate probability. Look up base rates and actual statistics before reacting.",
@@ -472,22 +432,18 @@ def analyze_text(text):
             "Evaluate claims critically before sharing.",
         ]
 
-    # build the counter-message string for display and PDF
     counter_message = "**Counter-messages for this specific content:**\n\n"
     counter_message += "\n\n".join(f"- {c}" for c in raw_counters[:6])
 
-    # =============================
-    # ADVICE
-    # =============================
     advice_lines = []
     if score >= 70:
-        advice_lines.append("🔴 **Do NOT share** this content without verifying it through at least 3 independent credible sources.")
+        advice_lines.append("🔴 **Do NOT share** this content without verifying through at least 3 independent credible sources.")
         advice_lines.append("🔴 Notice your emotional reaction — the reaction itself may be the manipulation.")
     elif score >= 40:
         advice_lines.append("🟡 **Approach with caution.** Verify key claims with primary sources before acting or sharing.")
 
     if fake_p > 0.6:
-        advice_lines.append("🔴 The AI flagged likely fabrication. Try to find the original event or study mentioned — it may not exist or may be misrepresented.")
+        advice_lines.append("🔴 The AI flagged likely fabrication. Try to find the original event or study mentioned — it may not exist.")
     elif fake_p > 0.4:
         advice_lines.append("🟡 Possible content distortion. Check the original source rather than relying on this version.")
 
@@ -506,7 +462,6 @@ def analyze_text(text):
 
     advice_block = "\n\n".join(advice_lines)
 
-    # --- highlighted text ---
     highlighted_text = text
     for word in sorted(all_matched_words, key=len, reverse=True):
         highlighted_text = re.sub(
@@ -560,7 +515,6 @@ def generate_pdf(text, score, trigger_counts, explanation, counter_message, risk
 
     elements.append(Spacer(1, 0.2 * inch))
     elements.append(Paragraph("AI Explanation:", style["Heading2"]))
-    # strip markdown bold markers for PDF
     clean_exp = re.sub(r"\*\*(.+?)\*\*", r"\1", explanation)
     for line in clean_exp.split("\n\n"):
         if line.strip():
@@ -595,15 +549,10 @@ def generate_pdf(text, score, trigger_counts, explanation, counter_message, risk
 
 
 # =============================
-# UI INPUT
+# UI — IMAGE UPLOAD
 # =============================
-
-# --- image upload section ---
-# shown above the text area; when user uploads an image and clicks
-# "Extract Text", the OCR result is dropped into session_state so
-# the text area below is pre-filled and ready to analyze
 st.markdown("#### 🖼️ Upload an Image (optional)")
-st.caption("Upload a screenshot, meme, news photo, or any image containing text — we'll extract and analyse it.")
+st.caption("Upload a screenshot, meme, news photo, or any image with text — we'll extract and analyse it.")
 
 uploaded_image = st.file_uploader(
     label="",
@@ -613,7 +562,7 @@ uploaded_image = st.file_uploader(
 
 if uploaded_image is not None:
     pil_img = Image.open(uploaded_image)
-    st.image(pil_img, caption="Uploaded Image", use_container_width=True)
+    st.image(pil_img, caption="Uploaded Image", width=600)
 
     if st.button("🔠 Extract Text from Image"):
         with st.spinner("Reading text from image..."):
@@ -622,17 +571,15 @@ if uploaded_image is not None:
             st.session_state["extracted_text"] = extracted
             st.success(f"Extracted {len(extracted.split())} words from image.")
         else:
-            st.warning("Could not find readable text in this image. Try a clearer or higher-resolution image.")
+            st.warning("Could not find readable text in this image. Try a clearer or higher-resolution photo.")
 
-    # show what was extracted so user can see/edit it
-    if "extracted_text" in st.session_state and st.session_state["extracted_text"]:
+    if st.session_state.get("extracted_text"):
         with st.expander("📄 Extracted Text (auto-filled below)", expanded=True):
             st.text(st.session_state["extracted_text"])
 
 st.markdown("---")
 st.markdown("#### 📝 Or Paste Text Directly")
 
-# pre-fill text area with OCR output if it exists, otherwise empty
 prefill = st.session_state.get("extracted_text", "")
 text_input = st.text_area("Paste the content here:", value=prefill, height=200)
 
@@ -651,7 +598,7 @@ if st.button("🔍 Analyze"):
 
         st.markdown("<div class='section-card'>", unsafe_allow_html=True)
 
-        # Gauge
+        # gauge — colour changes by risk level
         gauge_color = "#FF4B4B" if score >= 70 else ("#F59E0B" if score >= 40 else "#10B981")
         fig = go.Figure(go.Indicator(
             mode="gauge+number",
@@ -673,12 +620,12 @@ if st.button("🔍 Analyze"):
             title={"text": "Manipulation Score"},
         ))
         fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", font_color="white", height=280)
-        st.plotly_chart(fig, use_container_width=True, config={"responsive": True})
+        st.plotly_chart(fig, width="stretch", config={"responsive": True})
 
-        # Risk badge
+        # risk label
         st.markdown(f"### {risk}")
 
-        # Bar chart
+        # horizontal bar chart per category
         fig2, ax = plt.subplots(figsize=(8, 3))
         fig2.patch.set_alpha(0)
         ax.set_facecolor("#1C1F26")
@@ -693,19 +640,15 @@ if st.button("🔍 Analyze"):
         ax.set_title("Trigger Words by Category", color="white")
         st.pyplot(fig2)
 
-        # Explanation
         with st.expander("🤖 AI Explanation"):
             st.markdown(explanation)
 
-        # Counter-messages
         with st.expander("🛡 Counter-Messages"):
             st.markdown(counter_message)
 
-        # Advice
         with st.expander("💡 Advice"):
             st.markdown(advice_block)
 
-        # Propaganda & fallacies
         if propaganda_hits or fallacy_hits:
             with st.expander("📢 Propaganda Phrases & Logical Fallacies"):
                 if propaganda_hits:
@@ -717,7 +660,6 @@ if st.button("🔍 Analyze"):
                     for fname, fkws in fallacy_hits.items():
                         st.markdown(f"- **{fname}:** `{', '.join(fkws)}`")
 
-        # Extreme sentences
         if extreme_sentences:
             with st.expander("⚡ Most Emotionally Extreme Sentences"):
                 for s in extreme_sentences[:5]:
@@ -727,21 +669,18 @@ if st.button("🔍 Analyze"):
                         unsafe_allow_html=True,
                     )
 
-        # Highlighted text
         st.markdown("### 🔎 Highlighted Manipulative Words")
         st.markdown(
             f"<div style='line-height:1.9;font-size:0.95rem;white-space:pre-wrap;'>{highlighted_text}</div>",
             unsafe_allow_html=True,
         )
 
-        # Word list
         st.markdown("### 📝 Manipulative Words Found")
         if manipulative_words:
             st.write(", ".join(manipulative_words))
         else:
             st.write("None detected.")
 
-        # PDF download
         pdf_buf = generate_pdf(
             text_input, score, trigger_counts,
             explanation, counter_message, risk,

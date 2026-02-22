@@ -8,3 +8,4 @@ textblob
 accelerate
 reportlab
 sentencepiece
+easyocr pillow

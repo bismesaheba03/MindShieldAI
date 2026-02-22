@@ -6,6 +6,8 @@ import streamlit as st
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from textblob import TextBlob
+from PIL import Image
+import easyocr
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
@@ -182,6 +184,27 @@ def load_transformer_model():
     return tokenizer, model
 
 tokenizer, transformer_model = load_transformer_model()
+
+
+# =============================
+# OCR MODEL LOADING
+# easyocr is cached just like the transformer — loads once per session
+# gpu=True speeds it up if CUDA is available, falls back to CPU otherwise
+# =============================
+@st.cache_resource
+def load_ocr_reader():
+    return easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+
+ocr_reader = load_ocr_reader()
+
+
+def extract_text_from_image(pil_image):
+    """Convert a PIL image to an RGB numpy array and run easyocr on it.
+    Returns a single string with all detected text joined by newlines."""
+    img_array = np.array(pil_image.convert("RGB"))
+    # paragraph=True groups nearby words into coherent sentences
+    results = ocr_reader.readtext(img_array, detail=0, paragraph=True)
+    return "\n".join(results).strip()
 
 
 # =============================
@@ -572,14 +595,51 @@ def generate_pdf(text, score, trigger_counts, explanation, counter_message, risk
 
 
 # =============================
-# UI INPUT (original layout, untouched)
+# UI INPUT
 # =============================
-text_input = st.text_area("Paste the content here:", height=200)
+
+# --- image upload section ---
+# shown above the text area; when user uploads an image and clicks
+# "Extract Text", the OCR result is dropped into session_state so
+# the text area below is pre-filled and ready to analyze
+st.markdown("#### 🖼️ Upload an Image (optional)")
+st.caption("Upload a screenshot, meme, news photo, or any image containing text — we'll extract and analyse it.")
+
+uploaded_image = st.file_uploader(
+    label="",
+    type=["jpg", "jpeg", "png", "webp", "bmp"],
+    label_visibility="collapsed",
+)
+
+if uploaded_image is not None:
+    pil_img = Image.open(uploaded_image)
+    st.image(pil_img, caption="Uploaded Image", use_container_width=True)
+
+    if st.button("🔠 Extract Text from Image"):
+        with st.spinner("Reading text from image..."):
+            extracted = extract_text_from_image(pil_img)
+        if extracted:
+            st.session_state["extracted_text"] = extracted
+            st.success(f"Extracted {len(extracted.split())} words from image.")
+        else:
+            st.warning("Could not find readable text in this image. Try a clearer or higher-resolution image.")
+
+    # show what was extracted so user can see/edit it
+    if "extracted_text" in st.session_state and st.session_state["extracted_text"]:
+        with st.expander("📄 Extracted Text (auto-filled below)", expanded=True):
+            st.text(st.session_state["extracted_text"])
+
+st.markdown("---")
+st.markdown("#### 📝 Or Paste Text Directly")
+
+# pre-fill text area with OCR output if it exists, otherwise empty
+prefill = st.session_state.get("extracted_text", "")
+text_input = st.text_area("Paste the content here:", value=prefill, height=200)
 
 if st.button("🔍 Analyze"):
 
     if text_input.strip() == "":
-        st.warning("Please enter some text.")
+        st.warning("Please enter some text or upload an image first.")
     else:
         with st.spinner("Running analysis..."):
             (

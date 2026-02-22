@@ -1,6 +1,8 @@
 import re
 import math
 import torch
+import math
+import torch
 import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
@@ -187,10 +189,18 @@ tokenizer, transformer_model = load_transformer_model()
 # =============================
 @st.cache_resource
 def load_easyocr_reader():
+    """Load EasyOCR with full error protection. Returns None if unavailable."""
     try:
         import easyocr
-        return easyocr.Reader(["en"], gpu=False, verbose=False)
-    except Exception:
+        # model_storage_directory prevents repeated downloads between reruns
+        reader = easyocr.Reader(
+            ["en"],
+            gpu=False,
+            verbose=False,
+            download_enabled=True,
+        )
+        return reader
+    except Exception as e:
         return None
 
 
@@ -244,6 +254,8 @@ def _tesseract_on_pil(pil_gray, psm: int = 11) -> str:
 
 
 def _preprocess_variants(pil_rgb: Image.Image):
+    if not CV2_AVAILABLE:
+        return []
     """
     Generate a list of preprocessed PIL-grayscale images from an RGB PIL image.
     Returns list of (label, pil_gray_image) tuples.
@@ -327,9 +339,12 @@ def _run_tesseract_all(variants):
     results = []
     for label, pil_gray in variants:
         for psm in [6, 11, 3]:
-            text = _tesseract_on_pil(pil_gray, psm=psm)
-            if text:
-                results.append(text)
+            try:
+                text = _tesseract_on_pil(pil_gray, psm=psm)
+                if text:
+                    results.append(text)
+            except Exception:
+                pass
     return results
 
 
@@ -365,13 +380,34 @@ def extract_text_from_image(pil_image: Image.Image) -> str:
 
     all_texts = []
 
-    # --- Tesseract engine ---
+    # --- Basic Tesseract fallback (always runs, even without cv2) ---
     try:
-        variants = _preprocess_variants(pil_rgb)
-        tess_results = _run_tesseract_all(variants)
-        all_texts.extend(tess_results)
+        gray_basic = pil_rgb.convert("L")
+        w, h = gray_basic.size
+        big_gray = gray_basic.resize((w * 3, h * 3), Image.LANCZOS)
+        big_contrast = ImageEnhance.Contrast(big_gray).enhance(2.5)
+        for psm in [6, 11, 3]:
+            t = _tesseract_on_pil(big_gray, psm=psm)
+            if t:
+                all_texts.append(t)
+            t2 = _tesseract_on_pil(big_contrast, psm=psm)
+            if t2:
+                all_texts.append(t2)
+        inv = ImageOps.invert(big_gray)
+        t3 = _tesseract_on_pil(inv, psm=11)
+        if t3:
+            all_texts.append(t3)
+    except Exception:
+        pass
+
+    # --- Advanced cv2 preprocessing (runs only if cv2 available) ---
+    try:
+        if CV2_AVAILABLE:
+            variants = _preprocess_variants(pil_rgb)
+            tess_results = _run_tesseract_all(variants)
+            all_texts.extend(tess_results)
     except Exception as e:
-        st.warning(f"Tesseract preprocessing error (non-fatal): {e}")
+        pass
 
     # --- EasyOCR engine ---
     try:
@@ -379,8 +415,8 @@ def extract_text_from_image(pil_image: Image.Image) -> str:
         if reader is not None:
             easy_results = _run_easyocr(pil_rgb, reader)
             all_texts.extend(easy_results)
-    except Exception as e:
-        st.warning(f"EasyOCR error (non-fatal): {e}")
+    except Exception:
+        pass
 
     if not all_texts:
         return ""

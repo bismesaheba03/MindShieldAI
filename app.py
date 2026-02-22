@@ -182,12 +182,107 @@ tokenizer, transformer_model = load_transformer_model()
 
 
 # =============================
-# OCR — pytesseract (no model download, installed via packages.txt)
+# OCR — color-aware preprocessing for tough images
+# plain grayscale fails on yellow/white text over dark busy backgrounds
+# so we use numpy to isolate text by brightness and color before OCR
 # =============================
+def _run_ocr(pil_img, psm=11):
+    config = f"--psm {psm} --oem 3"
+    try:
+        return pytesseract.image_to_string(pil_img, config=config).strip()
+    except Exception:
+        return ""
+
+
+def _score_text(text):
+    """Score by real English words — penalise single chars and junk symbols."""
+    if not text:
+        return 0
+    # count proper words (3+ letters — filters out OCR noise like 'a', 'f', '|')
+    words = re.findall(r"[A-Za-z]{3,}", text)
+    junk  = len(re.findall(r"[^A-Za-z0-9\s'\".,!?'-]", text))
+    return len(words) * 5 - junk * 2
+
+
+def _clean_ocr(text):
+    """Keep only lines that are mostly alphabetic, strip noise, join."""
+    good = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        alpha = sum(1 for c in line if c.isalpha())
+        # need at least 50% letters, minimum 3 alpha chars
+        if alpha >= 3 and alpha / max(len(line), 1) >= 0.50:
+            # strip leading symbols from each line
+            line = re.sub(r"^[^A-Za-z']+", "", line).strip()
+            if line:
+                good.append(line)
+    out = " ".join(good)
+    out = re.sub(r"\s+", " ", out)
+    return out.strip()
+
+
+def _make_mask(arr, condition):
+    """Return a PIL greyscale image where condition pixels are white, rest black."""
+    mask = condition.astype(np.uint8) * 255
+    return Image.fromarray(mask)
+
+
 def extract_text_from_image(pil_image):
+    """
+    Multi-pass OCR that handles stylized meme/news text:
+    - Large bold white text on dark photo backgrounds
+    - Yellow text on dark backgrounds
+    - Mixed colour overlays
+    Runs ~12 preprocessing variants and returns the one with the most real words.
+    """
+    from PIL import ImageEnhance, ImageOps, ImageFilter
+
     rgb = pil_image.convert("RGB")
-    text = pytesseract.image_to_string(rgb)
-    return text.strip()
+    w, h = rgb.size
+
+    # upscale 3x — single biggest accuracy improvement for tesseract
+    big = rgb.resize((w * 3, h * 3), Image.LANCZOS)
+    arr = np.array(big, dtype=np.float32)
+    R, G, B = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+
+    attempts = []
+    gray_pil = big.convert("L")
+
+    # ---- bright text masks at several thresholds ----
+    # lower threshold = more pixels included = better recall but more noise
+    brightness = (R + G + B) / 3.0
+    for thr in [140, 160, 180, 200]:
+        mask = _make_mask(arr, brightness > thr)
+        attempts.append(_run_ocr(mask, psm=11))
+        attempts.append(_run_ocr(mask, psm=6))
+
+    # ---- yellow text mask (high R+G, low B — catches yellow on dark) ----
+    yellow = (R > 150) & (G > 120) & (B < 110)
+    attempts.append(_run_ocr(_make_mask(arr, yellow), psm=11))
+    attempts.append(_run_ocr(_make_mask(arr, yellow), psm=6))
+
+    # ---- combined white + yellow ----
+    white_or_yellow = (brightness > 160) | yellow
+    attempts.append(_run_ocr(_make_mask(arr, white_or_yellow), psm=11))
+
+    # ---- high-contrast greyscale ----
+    hi = ImageEnhance.Contrast(gray_pil).enhance(3.0)
+    attempts.append(_run_ocr(hi, psm=11))
+    attempts.append(_run_ocr(hi, psm=6))
+
+    # ---- inverted (for dark-on-light text regions) ----
+    inv = ImageOps.invert(gray_pil)
+    attempts.append(_run_ocr(ImageEnhance.Contrast(inv).enhance(2.5), psm=11))
+
+    # ---- sharpened ----
+    sharp = gray_pil.filter(ImageFilter.SHARPEN).filter(ImageFilter.SHARPEN)
+    attempts.append(_run_ocr(ImageEnhance.Contrast(sharp).enhance(2.5), psm=11))
+
+    # pick the attempt with the most real 3+ letter words
+    best = max(attempts, key=_score_text)
+    return _clean_ocr(best)
 
 
 # =============================

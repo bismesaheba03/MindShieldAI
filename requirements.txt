@@ -11,5 +11,6 @@ sentencepiece
 easyocr 
 pillow
 pytesseract
-opencv-python-headless
+
+
 
